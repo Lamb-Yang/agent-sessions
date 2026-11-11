@@ -9,7 +9,7 @@ Tern 插件：一个 block，列出本机 omp / pi / OpenCode 的历史会话，
 tern plugin install github.com/<你的用户名>/tern-agent-sessions
 ```
 
-本地开发用 `tern plugin link ~/src/agent-sessions`（保存即热重载）。
+本地开发用 `tern plugin link ~/Documents/github/agent-sessions`（保存即热重载）。
 
 ## 使用
 
