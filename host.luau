@@ -18,10 +18,18 @@ type State = {
 	cwd: string,
 	mode: string, -- "project" | "all"
 	rows: { Row },
+	rows_rev: number, -- 每次扫描+1，供界面缓存判断
+	tags: { [string]: { string } }, -- 会话 id → 标签列表（tern.kv "tags"）
+	tags_rev: number, -- 每次标签增删+1，供界面缓存判断
 	filter: string,
+	dialog: { row_id: string, text: string, cursor: number }?, -- 打标签弹窗；cursor 为 UTF-16 单位
 	sel: number,
+	vis_n: number, -- 当前可见行数（随界面缓存更新）
 	loading: boolean,
 	err: string?,
+	-- 界面缓存：弹窗输入时主列表不变，避免每键重建整棵树
+	body_cache: any?,
+	body_sig: string?,
 }
 
 local HOME = tern.getenv("HOME") or ""
@@ -64,8 +72,7 @@ local function ms_to_short(ms: number): string
 	end
 	local days, rem = ms // 86400000, ms % 86400000
 	local y, mo, d = days_civil(days)
-	return string.format("%02d-%02d %02d:%02d", mo, d, rem // 3600000, (rem % 3600000) // 60000)
-		.. (if y < 2026 then string.format(" '%02d", y % 100) else "")
+	return string.format("'%02d-%02d-%02d %02d:%02d", y % 100, mo, d, rem // 3600000, (rem % 3600000) // 60000)
 end
 
 -- ---------- 工具 ----------
@@ -190,6 +197,110 @@ local function collect(out: { Row }, stdout: string)
 	end
 end
 
+-- ---------- 标签 ----------
+
+-- 持久存储在 tern.kv 的 "tags" 键：{ [会话id] = { 标签… } }
+local function load_tags(): { [string]: { string } }
+	local t = tern.kv.get("tags")
+	return if type(t) == "table" then t else {}
+end
+
+-- input 字段的 cursor 按 UTF-16 单位计（BMP 1 单元，emoji 等增补平面 2 单元）；
+-- 下面把字节偏移与 UTF-16 偏移互转。
+local function char_len(s: string, p: number): number
+	local c = string.byte(s, p) or 0
+	return if c < 0x80 then 1 elseif c < 0xE0 then 2 elseif c < 0xF0 then 3 else 4
+end
+
+local function cp_units(s: string, p: number): number
+	return if char_len(s, p) == 4 then 2 else 1
+end
+
+local function u16_to_byte(s: string, units: number): number
+	local p, u = 1, 0
+	while p <= #s do
+		local w = cp_units(s, p)
+		if u + w > units then
+			break
+		end
+		u += w
+		p += char_len(s, p)
+	end
+	return p - 1
+end
+
+local function byte_to_u16(s: string, bytes: number): number
+	local p, u = 1, 0
+	while p < bytes do
+		u += cp_units(s, p)
+		p += char_len(s, p)
+	end
+	return u
+end
+
+local function u16_len(s: string): number
+	return byte_to_u16(s, #s + 1)
+end
+
+-- 中英文逗号分隔多个标签，去首尾空白，丢弃空项
+local function split_tags(text: string): { string }
+	local out: { string } = {}
+	for part in string.gmatch(string.gsub(text, "，", ","), "[^,]+") do
+		part = trim(part)
+		if part ~= "" then
+			table.insert(out, part)
+		end
+	end
+	return out
+end
+
+-- 添加（重复忽略）；移除走 remove_tag
+local function add_tags(s: State, row_id: string, list: { string })
+	if #list == 0 then
+		return
+	end
+	local tags = load_tags()
+	local cur = tags[row_id] or {}
+	local dirty = false
+	for _, tg in list do
+		local dup = false
+		for _, have in cur do
+			if have == tg then
+				dup = true
+				break
+			end
+		end
+		if not dup then
+			table.insert(cur, tg)
+			dirty = true
+		end
+	end
+	if dirty then
+		tags[row_id] = cur
+		tern.kv.set("tags", tags)
+		s.tags = tags
+		s.tags_rev += 1
+	end
+end
+
+local function remove_tag(s: State, row_id: string, tag: string)
+	local tags = load_tags()
+	local list = tags[row_id]
+	if not list then
+		return
+	end
+	for i, tg in list do
+		if tg == tag then
+			table.remove(list, i)
+			tags[row_id] = if #list > 0 then list else nil
+			tern.kv.set("tags", tags)
+			s.tags = tags
+			s.tags_rev += 1
+			return
+		end
+	end
+end
+
 -- ---------- 过滤 ----------
 
 -- macOS 把 /tmp、/var 等真实路径变成 /private/tmp：两边都去掉 /private 前缀再比。
@@ -205,9 +316,23 @@ end
 local function visible(s: State): { Row }
 	local out: { Row } = {}
 	local fl = string.lower(s.filter)
+	-- "#标签名" 前缀：只看带匹配标签的会话；单独 "#" 看所有带标签的
+	local tagq = if string.sub(fl, 1, 1) == "#" then string.sub(fl, 2) else nil
 	for _, r in s.rows do
 		if s.mode == "all" or under(r.cwd, s.cwd) or under(s.cwd, r.cwd) then
-			if fl == "" or string.find(string.lower(r.agent .. " " .. r.title .. " " .. r.cwd), fl, 1, true) then
+			local hit: boolean
+			if tagq then
+				hit = false
+				for _, tg in s.tags[r.id] or {} do
+					if tagq == "" or string.find(string.lower(tg), tagq, 1, true) then
+						hit = true
+						break
+					end
+				end
+			else
+				hit = fl == "" or string.find(string.lower(r.agent .. " " .. r.title .. " " .. r.cwd), fl, 1, true) ~= nil
+			end
+			if hit then
 				table.insert(out, r)
 			end
 		end
@@ -222,6 +347,33 @@ local function pane_alive(cx): boolean
 		end
 	end
 	return false
+end
+
+-- ---------- 打标签弹窗 ----------
+
+-- 弹窗的 input 节点 id（子节点 id 用 key 连接）
+local FIELD_ID = "layer.tags.field"
+
+local function open_dialog(s: State, row_id: string, cx)
+	s.dialog = { row_id = row_id, text = "", cursor = 0 }
+	-- 等 view 渲染出弹窗后再把焦点给输入框（光标与中文 IME 组合窗都画在字段上）
+	tern.timer(50, function()
+		if pane_alive(cx) then
+			cx:frame({ { "focus", FIELD_ID } })
+		end
+	end)
+end
+
+local function close_dialog(s: State)
+	s.dialog = nil
+end
+
+local function save_dialog(s: State)
+	local d = s.dialog
+	if d then
+		add_tags(s, d.row_id, split_tags(d.text))
+	end
+	close_dialog(s)
 end
 
 local function scan(cx, s: State)
@@ -243,6 +395,25 @@ local function scan(cx, s: State)
 			return a.when_ms > b.when_ms
 		end)
 		s.rows = rows
+		s.rows_rev += 1
+		-- 刷新标签；会话文件已消失的条目顺手清掉
+		local tags = load_tags()
+		local alive: { [string]: boolean } = {}
+		for _, row in rows do
+			alive[row.id] = true
+		end
+		local dirty = false
+		for id in tags do
+			if not alive[id] then
+				tags[id] = nil
+				dirty = true
+			end
+		end
+		if dirty then
+			tern.kv.set("tags", tags)
+		end
+		s.tags = tags
+		s.tags_rev += 1
 		cx:render()
 	end)
 end
@@ -254,6 +425,82 @@ end
 
 -- ---------- block ----------
 
+-- ---------- 列表主体 ----------
+
+local function with_props(node: any, props: { [string]: any }): any
+	local p: { [string]: any } = node.p or {}
+	for k, v in props do
+		p[k] = v
+	end
+	node.p = p
+	return node
+end
+
+-- 两行式行：第一行 agent + 标题；第二行 路径 · 时间 · #标签
+local function row_node(s: State, r: Row, cur: boolean, idx: number): any
+	local menu: { string } = { "加标签…" }
+	for _, tg in s.tags[r.id] or {} do
+		table.insert(menu, 1, "移除:" .. tg)
+	end
+	local acts = { click = "sel", dblclick = "open", menu = menu }
+	local line1: { any } = {
+		ui.span(if cur then "▸ " else "  ", if cur then "strong" else "muted"),
+		ui.span(r.agent, if cur then "strong" else "accent"),
+		ui.span("  "),
+		ui.span(if r.title ~= "" then (string.gsub(r.title, "[\r\n]+", " ")) else "(无标题)", if cur then "strong" else ""),
+	}
+	local line2: { any } = { ui.span(r.cwd, "muted") }
+	if r.when_ms > 0 then
+		table.insert(line2, ui.span("  " .. ms_to_short(r.when_ms), "muted num"))
+	end
+	for _, tg in s.tags[r.id] or {} do
+		table.insert(line2, ui.span("  #" .. tg, "accent"))
+	end
+	-- 点击/双击/右键同时挂在行与两个文本节点上（文本也是命中目标）
+	return ui.node("col", { key = "r" .. idx, gap = "xs", actions = acts }, {
+		with_props(ui.text(line1), { actions = acts }),
+		with_props(ui.text(line2), { actions = acts }),
+	})
+end
+
+local function build_body(s: State, vis: { Row }): any
+	s.vis_n = #vis
+	local nodes: { any } = {}
+	if #vis == 0 then
+		table.insert(nodes, ui.text({ ui.span("没有匹配的会话（r 重扫，Tab 看全部）", "muted") }))
+	else
+		for i, r in vis do
+			nodes[i] = row_node(s, r, i == s.sel, i)
+		end
+	end
+
+	local head_items: { any } = {}
+	local function push(node: any)
+		if node ~= nil then
+			table.insert(head_items, node)
+		end
+	end
+	push(ui.badge(if s.mode == "project" then "本项目" else "全部", "accent"))
+	push(ui.text({ ui.span(if s.mode == "project" then s.cwd else "所有目录", "muted") }))
+	push(ui.text({ ui.span(#vis .. " 条", "muted num") }))
+	if s.loading then
+		push(ui.badge("扫描中…", "pending"))
+	elseif s.err then
+		push(ui.badge(s.err, "error"))
+	end
+	if s.filter ~= "" then
+		push(ui.badge(if string.sub(s.filter, 1, 1) == "#" then "标签 " .. clip(s.filter, 30) else "过滤 " .. clip(s.filter, 30), "info"))
+	end
+
+	return {
+		main = ui.col({ ui.row(head_items), ui.node("col", { key = "list", gap = "xs" }, nodes) }),
+		dock = ui.col({
+			ui.text({ ui.span("↑↓ 移动 · Enter 新 tab 恢复 · Tab 本项目/全部 · ⌃T 打标签（弹窗，逗号分隔多个） · 输入 #标签名 只看该标签 · ⌃R 刷新 · Esc 清除", "muted") }),
+		}),
+		vis = vis,
+	}
+end
+
 local sessions: BlockDef<State> = {
 	init = function(cx, args, saved)
 		local cwd = (args and args[1] and args[1] ~= "") and args[1] or (cx.cwd or HOME)
@@ -264,8 +511,13 @@ local sessions: BlockDef<State> = {
 			cwd = cwd,
 			mode = if saved and saved.mode == "all" then "all" else "project",
 			rows = {},
+			rows_rev = 0,
+			tags = load_tags(),
+			tags_rev = 0,
 			filter = if saved then tostring(saved.filter or "") else "",
+			dialog = nil,
 			sel = if saved then math.max(tonumber(saved.sel) or 1, 1) else 1,
+			vis_n = 0,
 			loading = false,
 			err = nil,
 		}
@@ -288,71 +540,136 @@ local sessions: BlockDef<State> = {
 	end,
 
 	view = function(s, _cx)
-		local vis = visible(s)
-		if s.sel > #vis then
-			s.sel = math.max(#vis, 1)
+		-- 主列表按状态签名缓存：弹窗打字不改变列表，直接复用上次构建的节点
+		local function sig_of(): string
+			return string.format("%s\1%s\1%d\1%d\1%d\1%s\1%s", s.mode, s.filter, s.sel, s.rows_rev, s.tags_rev, tostring(s.loading), s.err or "")
 		end
-
-		local cols: { { [string]: any } } = {
-			{ id = "when", head = "时间", mono = true, priority = 3 },
-			{ id = "agent", head = "Agent", priority = 2 },
-			{ id = "title", head = "标题", grow = 1, truncate = "end" },
-		}
-		if s.mode == "all" then
-			table.insert(cols, { id = "cwd", head = "目录", grow = 1, truncate = "middle", priority = 4 })
-		end
-
-		local rows: { any } = {}
-		for i, r in vis do
-			local cur = i == s.sel
-			local cells: { any } = {
-				{ ui.span(ms_to_short(r.when_ms), if cur then "num strong" else "num muted") },
-				{ ui.span(r.agent, if cur then "strong" else "accent") },
-				if r.title ~= "" then r.title else { ui.span("(无标题)", "muted") },
-			}
-			if s.mode == "all" then
-				table.insert(cells, { ui.span(r.cwd, "muted") })
+		local sig = sig_of()
+		local body = s.body_cache
+		if s.body_sig ~= sig or body == nil then
+			local vis = visible(s)
+			if s.sel > #vis then
+				s.sel = math.max(#vis, 1)
+				sig = sig_of()
 			end
-			rows[i] = { id = r.id, cells = cells }
+			body = build_body(s, vis)
+			s.body_cache, s.body_sig = body, sig
 		end
 
-		local table_node = ui.table(cols, rows, {
-			selectable = true,
-			selected = if vis[s.sel] then vis[s.sel].id else nil,
-			empty = { ui.span("没有匹配的会话（r 重扫，Tab 看全部）", "muted") },
-		})
-		local tp: { [string]: any } = table_node.p or {}
-		tp.key = "t"
-		table_node.p = tp
-
-		local head_items: { any } = {}
-		local function push(node: any)
-			if node ~= nil then
-				table.insert(head_items, node)
+		-- ⌃T 弹窗：打标签。overlay 不抢键盘，键在 key 里按状态路由。
+		local layer
+		local d = s.dialog
+		if d then
+			local row: Row? = nil
+			for _, r in s.rows do
+				if r.id == d.row_id then
+					row = r
+					break
+				end
 			end
-		end
-		push(ui.badge(if s.mode == "project" then "本项目" else "全部", "accent"))
-		push(ui.text({ ui.span(if s.mode == "project" then s.cwd else "所有目录", "muted") }))
-		push(ui.text({ ui.span(#vis .. " 条", "muted num") }))
-		if s.loading then
-			push(ui.badge("扫描中…", "pending"))
-		elseif s.err then
-			push(ui.badge(s.err, "error"))
-		end
-		if s.filter ~= "" then
-			push(ui.badge("过滤 " .. clip(s.filter, 30), "info"))
+			local have = s.tags[d.row_id] or {}
+			local chips: { any } = {}
+			if #have == 0 then
+				table.insert(chips, ui.badge("还没有标签", "muted"))
+			else
+				for _, tg in have do
+					local b = ui.badge("#" .. tg, "accent")
+					local bp: { [string]: any } = b.p or {}
+					bp.key = "tg" .. tg
+					bp.actions = { click = "untag=" .. tg }
+					b.p = bp
+					table.insert(chips, b)
+				end
+			end
+			layer = ui.col({
+				ui.node("overlay", {
+					key = "tags",
+					icon = "terminal",
+					head = { ui.span("打标签") },
+					meta = { ui.span(if row then clip(row.title, 24) else "", "muted") },
+					size = "sm",
+					modal = true,
+					foot = "layer.tags.foot",
+				}, {
+					ui.node("row", { key = "have", gap = "sm" }, chips),
+					ui.node("input", {
+						key = "field",
+						text = d.text,
+						cursor = d.cursor,
+						placeholder = "输入标签，逗号分隔可一次加多个，回车保存",
+					}),
+					ui.node("row", { key = "foot", gap = "sm", justify = "end" }, {
+						ui.button("取消", { variant = "quiet", keys = { "esc" }, actions = { click = "close-dialog" } }),
+						ui.button("保存", { keys = { "enter" }, actions = { click = "save-dialog" } }),
+					}),
+				}),
+			})
 		end
 
 		return {
-			main = ui.col({ ui.row(head_items), table_node }),
-			dock = ui.col({
-				ui.text({ ui.span("↑↓ 移动 · Enter 新分屏恢复 · Tab 本项目/全部 · ⌃R 刷新 · 直接输入过滤（支持中文/粘贴） · Esc 清除", "muted") }),
-			}),
+			main = body.main,
+			layer = layer,
+			dock = body.dock,
 		}
 	end,
 
 	key = function(s, key, cx)
-		local n = math.max(#visible(s), 1)
+		-- ⌃T 弹窗开着：所有键先喂输入框（input 的文本由程序拥有）。
+		-- 走在 visible 全表扫描之前；显式 render + return false 跳过每键的块状态落盘。
+		local d = s.dialog
+		if d then
+			if key.name == "escape" then
+				close_dialog(s)
+			elseif key.name == "enter" then
+				save_dialog(s)
+			elseif key.name == "left" then
+				d.cursor = math.max(d.cursor - 1, 0)
+			elseif key.name == "right" then
+				d.cursor = math.min(d.cursor + 1, u16_len(d.text))
+			elseif key.name == "home" then
+				d.cursor = 0
+			elseif key.name == "end" then
+				d.cursor = u16_len(d.text)
+			elseif key.name == "backspace" then
+				if d.cursor > 0 then
+					local b = u16_to_byte(d.text, d.cursor)
+					local p = b - 1
+					-- 退到上一个 UTF-8 字符的起点
+					while p > 1 and (string.byte(d.text, p) or 0) >= 0x80 and (string.byte(d.text, p) or 0) < 0xC0 do
+						p -= 1
+					end
+					local units = byte_to_u16(string.sub(d.text, p, b), b - p + 1)
+					d.text = string.sub(d.text, 1, p - 1) .. string.sub(d.text, b + 1)
+					d.cursor -= units
+				end
+			elseif key.name == "delete" then
+				local b = u16_to_byte(d.text, d.cursor)
+				if b < #d.text then
+					local p = b + 1
+					d.text = string.sub(d.text, 1, b) .. string.sub(d.text, p + char_len(d.text, p))
+				end
+			elseif key.name == "paste" and key.text then
+				local t = string.gsub(key.text, "[\r\n]+", " ")
+				local b = u16_to_byte(d.text, d.cursor)
+				d.text = string.sub(d.text, 1, b) .. t .. string.sub(d.text, b + 1)
+				d.cursor += u16_len(t)
+			elseif key.text and #key.text > 0 and not key.ctrl and not key.meta and not key.alt then
+				local b = u16_to_byte(d.text, d.cursor)
+				d.text = string.sub(d.text, 1, b) .. key.text .. string.sub(d.text, b + 1)
+				d.cursor += cp_units(key.text, 1)
+			end
+			cx:render()
+			return false
+		end
+		local n = math.max(s.vis_n, 1)
+		if key.name == "t" and key.ctrl then
+			local r = visible(s)[s.sel]
+			if r then
+				open_dialog(s, r.id, cx)
+				return true
+			end
+			return false
+		end
 		if key.name == "up" or (key.name == "k" and s.filter == "") then
 			s.sel = math.max(s.sel - 1, 1)
 		elseif key.name == "down" or (key.name == "j" and s.filter == "") then
@@ -400,6 +717,49 @@ local sessions: BlockDef<State> = {
 	end,
 
 	event = function(s, ev, cx)
+		if ev.ev == "error" then
+			-- Tern 拒绝了 view/op：显示到表头，否则完全静默（日志里有）
+			s.err = "视图错误: " .. clip(tostring(ev.msg or ""), 60)
+			return
+		end
+		if ev.ev == "action" then
+			local act = ev.act or ""
+			-- 弹窗内：已有标签 badge 点击移除；取消/保存按钮
+			if string.match(act, "^untag=") then
+				if s.dialog then
+					remove_tag(s, s.dialog.row_id, string.sub(act, 7))
+				end
+				return
+			elseif act == "close-dialog" then
+				close_dialog(s)
+				return
+			elseif act == "save-dialog" then
+				save_dialog(s)
+				return
+			end
+			-- 列表行：节点 id 形如 main.list.r3（或其子节点 main.list.r3.1）
+			local idx = tonumber(string.match(ev.id or "", "%.r(%d+)"))
+			local vis = s.body_cache and s.body_cache.vis or visible(s)
+			local r = if idx then vis[idx] else nil
+			if not r then
+				return
+			end
+			if act == "sel" then
+				s.sel = idx :: number
+			elseif act == "open" then
+				s.sel = idx :: number
+				resume(r, cx)
+			elseif act == "加标签…" then
+				s.sel = idx :: number
+				open_dialog(s, r.id, cx)
+			else
+				local tag = string.match(act, "^移除:(.+)$")
+				if tag then
+					remove_tag(s, r.id, tag)
+				end
+			end
+			return
+		end
 		if ev.ev ~= "select" and ev.ev ~= "activate" then
 			return
 		end

@@ -33,7 +33,7 @@ tern.command({
 				return
 			end
 		end
-		local pane = cx:new_block(KIND, { project_cwd(cx) }, "below")
+		local pane = cx:new_block(KIND, { project_cwd(cx) }, "tab")
 		if pane == nil then
 			cx:toast("error", "Agent Sessions", "无法打开会话列表 block")
 		end
@@ -53,13 +53,8 @@ tern.route.link(function(link, cx)
 		cwd = if type(job.cwd) == "string" and job.cwd ~= "" then job.cwd else nil,
 		command = job.cmd,
 	}
-	local pane
-	if link.pane then
-		pane = cx.layout:split(link.pane, "right", launch)
-	end
-	if pane == nil then
-		pane = cx.layout:new_tab(launch)
-	end
+	-- 恢复的会话一律开新 tab
+	local pane = cx.layout:new_tab(launch)
 	if pane then
 		cx.layout:focus(pane)
 	else
