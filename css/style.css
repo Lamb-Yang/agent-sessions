@@ -118,3 +118,17 @@
 	padding: 6px 12px;
 	border-top: 1px solid var(--l1);
 }
+
+/* ---------- 搜索框 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-search"] {
+	margin: 2px 2px 8px;
+	font-size: 13px;
+	border-radius: var(--as-radius);
+	background: var(--l1);
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-search"].focused {
+	background: var(--panel);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+}

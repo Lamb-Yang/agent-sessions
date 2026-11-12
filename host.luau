@@ -21,7 +21,10 @@ type State = {
 	rows_rev: number, -- 每次扫描+1，供界面缓存判断
 	tags: { [string]: { string } }, -- 会话 id → 标签列表（tern.kv "tags"）
 	tags_rev: number, -- 每次标签增删+1，供界面缓存判断
-	filter: string,
+	filter: string, -- 搜索框文本（输入即显示）
+	applied: string, -- 实际用于过滤的文本（输入防抖后同步）
+	filter_cursor: number, -- 搜索框光标，UTF-16 单位
+	ftimer: any?, -- 过滤防抖定时器
 	dialog: { row_id: string, text: string, cursor: number }?, -- 打标签弹窗；cursor 为 UTF-16 单位
 	sel: number,
 	vis_n: number, -- 当前可见行数（随界面缓存更新）
@@ -242,6 +245,36 @@ local function u16_len(s: string): number
 	return byte_to_u16(s, #s + 1)
 end
 
+-- 在 cursor（UTF-16）处插入文本，返回新文本与新光标
+local function ins_text(t: string, cur: number, txt: string): (string, number)
+	local b = u16_to_byte(t, cur)
+	return string.sub(t, 1, b) .. txt .. string.sub(t, b + 1), cur + u16_len(txt)
+end
+
+-- 删除 cursor 前一个字符（按 UTF-8 字符边界回退，中文/emoji 不会乱码）
+local function del_back(t: string, cur: number): (string, number)
+	if cur <= 0 then
+		return t, cur
+	end
+	local b = u16_to_byte(t, cur)
+	local p = b - 1
+	while p > 1 and (string.byte(t, p) or 0) >= 0x80 and (string.byte(t, p) or 0) < 0xC0 do
+		p -= 1
+	end
+	local w = byte_to_u16(string.sub(t, p, b), b - p + 1)
+	return string.sub(t, 1, p - 1) .. string.sub(t, b + 1), cur - w
+end
+
+-- 删除 cursor 处一个字符
+local function del_fwd(t: string, cur: number): (string, number)
+	local b = u16_to_byte(t, cur)
+	if b >= #t then
+		return t, cur
+	end
+	local p = b + 1
+	return string.sub(t, 1, b) .. string.sub(t, p + char_len(t, p)), cur
+end
+
 -- 中英文逗号分隔多个标签，去首尾空白，丢弃空项
 local function split_tags(text: string): { string }
 	local out: { string } = {}
@@ -315,7 +348,7 @@ end
 
 local function visible(s: State): { Row }
 	local out: { Row } = {}
-	local fl = string.lower(s.filter)
+	local fl = string.lower(s.applied)
 	-- "#标签名" 前缀：只看带匹配标签的会话；单独 "#" 看所有带标签的
 	local tagq = if string.sub(fl, 1, 1) == "#" then string.sub(fl, 2) else nil
 	for _, r in s.rows do
@@ -347,6 +380,33 @@ local function pane_alive(cx): boolean
 		end
 	end
 	return false
+end
+
+local SEARCH_ID = "main.q"
+
+-- 把焦点交给某个字段（等 view 发出后，光标与 IME 才画得出来）
+local function focus_field(cx, id: string)
+	tern.timer(40, function()
+		if pane_alive(cx) then
+			cx:frame({ { "focus", id } })
+		end
+	end)
+end
+
+-- 搜索输入防抖：打字只更新输入框，稍后再重算列表
+local function schedule_filter(s: State, cx)
+	if s.ftimer then
+		s.ftimer.cancel()
+	end
+	s.ftimer = tern.timer(120, function()
+		if not pane_alive(cx) then
+			return
+		end
+		s.ftimer = nil
+		s.applied = s.filter
+		s.sel = 1
+		cx:render()
+	end)
 end
 
 -- ---------- 打标签弹窗 ----------
@@ -513,12 +573,13 @@ local function build_body(s: State, vis: { Row }): any
 	end
 
 	return {
-		main = ui.col({
+		main = with_props(ui.col({
 			ui.node("row", { key = "head", gap = "sm", role = "as-head" }, head_items),
 			ui.node("col", { key = "list", gap = "xs" }, nodes),
-		}),
+		}), { key = "body" }),
 		dock = ui.col({
 			ui.text({
+				ui.span("输入", "muted"), ui.span(" 搜索    ", "muted"),
 				ui.span("↑↓", "muted"), ui.span(" 移动    ", "muted"),
 				ui.span("enter", "key"), ui.span(" 恢复    ", "muted"),
 				ui.span("tab", "key"), ui.span(" 本项目/全部    ", "muted"),
@@ -547,6 +608,9 @@ local sessions: BlockDef<State> = {
 			tags = load_tags(),
 			tags_rev = 0,
 			filter = if saved then tostring(saved.filter or "") else "",
+			applied = if saved then tostring(saved.filter or "") else "",
+			filter_cursor = 0,
+			ftimer = nil,
 			dialog = nil,
 			sel = if saved then math.max(tonumber(saved.sel) or 1, 1) else 1,
 			vis_n = 0,
@@ -554,7 +618,9 @@ local sessions: BlockDef<State> = {
 			err = nil,
 		}
 		tern.kv.set("resume", nil)
+		s.filter_cursor = u16_len(s.filter)
 		scan(cx, s)
+		focus_field(cx, SEARCH_ID)
 		local function again()
 			tern.timer(60000, function()
 				if pane_alive(cx) then
@@ -574,7 +640,7 @@ local sessions: BlockDef<State> = {
 	view = function(s, _cx)
 		-- 主列表按状态签名缓存：弹窗打字不改变列表，直接复用上次构建的节点
 		local function sig_of(): string
-			return string.format("%s\1%s\1%d\1%d\1%d\1%s\1%s", s.mode, s.filter, s.sel, s.rows_rev, s.tags_rev, tostring(s.loading), s.err or "")
+			return string.format("%s\1%s\1%d\1%d\1%d\1%s\1%s", s.mode, s.applied, s.sel, s.rows_rev, s.tags_rev, tostring(s.loading), s.err or "")
 		end
 		local sig = sig_of()
 		local body = s.body_cache
@@ -640,7 +706,16 @@ local sessions: BlockDef<State> = {
 		end
 
 		return {
-			main = body.main,
+			main = ui.col({
+				ui.node("input", {
+					key = "q",
+					role = "as-search",
+					text = s.filter,
+					cursor = s.filter_cursor,
+					placeholder = "搜索标题 / agent / 目录；#标签 只看该标签",
+				}),
+				body.main,
+			}),
 			layer = layer,
 			dock = body.dock,
 		}
@@ -653,8 +728,10 @@ local sessions: BlockDef<State> = {
 		if d then
 			if key.name == "escape" then
 				close_dialog(s)
+				focus_field(cx, SEARCH_ID)
 			elseif key.name == "enter" then
 				save_dialog(s)
+				focus_field(cx, SEARCH_ID)
 			elseif key.name == "left" then
 				d.cursor = math.max(d.cursor - 1, 0)
 			elseif key.name == "right" then
@@ -664,32 +741,13 @@ local sessions: BlockDef<State> = {
 			elseif key.name == "end" then
 				d.cursor = u16_len(d.text)
 			elseif key.name == "backspace" then
-				if d.cursor > 0 then
-					local b = u16_to_byte(d.text, d.cursor)
-					local p = b - 1
-					-- 退到上一个 UTF-8 字符的起点
-					while p > 1 and (string.byte(d.text, p) or 0) >= 0x80 and (string.byte(d.text, p) or 0) < 0xC0 do
-						p -= 1
-					end
-					local units = byte_to_u16(string.sub(d.text, p, b), b - p + 1)
-					d.text = string.sub(d.text, 1, p - 1) .. string.sub(d.text, b + 1)
-					d.cursor -= units
-				end
+				d.text, d.cursor = del_back(d.text, d.cursor)
 			elseif key.name == "delete" then
-				local b = u16_to_byte(d.text, d.cursor)
-				if b < #d.text then
-					local p = b + 1
-					d.text = string.sub(d.text, 1, b) .. string.sub(d.text, p + char_len(d.text, p))
-				end
+				d.text, d.cursor = del_fwd(d.text, d.cursor)
 			elseif key.name == "paste" and key.text then
-				local t = string.gsub(key.text, "[\r\n]+", " ")
-				local b = u16_to_byte(d.text, d.cursor)
-				d.text = string.sub(d.text, 1, b) .. t .. string.sub(d.text, b + 1)
-				d.cursor += u16_len(t)
+				d.text, d.cursor = ins_text(d.text, d.cursor, string.gsub(key.text, "[\r\n]+", " "))
 			elseif key.text and #key.text > 0 and not key.ctrl and not key.meta and not key.alt then
-				local b = u16_to_byte(d.text, d.cursor)
-				d.text = string.sub(d.text, 1, b) .. key.text .. string.sub(d.text, b + 1)
-				d.cursor += cp_units(key.text, 1)
+				d.text, d.cursor = ins_text(d.text, d.cursor, key.text)
 			end
 			cx:render()
 			return false
@@ -703,18 +761,14 @@ local sessions: BlockDef<State> = {
 			end
 			return false
 		end
-		if key.name == "up" or (key.name == "k" and s.filter == "") then
+		if key.name == "up" then
 			s.sel = math.max(s.sel - 1, 1)
-		elseif key.name == "down" or (key.name == "j" and s.filter == "") then
+		elseif key.name == "down" then
 			s.sel = math.min(s.sel + 1, n)
 		elseif key.name == "page_up" then
 			s.sel = math.max(s.sel - 15, 1)
 		elseif key.name == "page_down" then
 			s.sel = math.min(s.sel + 15, n)
-		elseif key.name == "home" then
-			s.sel = 1
-		elseif key.name == "end" then
-			s.sel = n
 		elseif key.name == "enter" then
 			local r = visible(s)[s.sel]
 			if r then
@@ -723,26 +777,45 @@ local sessions: BlockDef<State> = {
 		elseif key.name == "tab" then
 			s.mode = if s.mode == "project" then "all" else "project"
 			s.sel = 1
+		elseif key.name == "r" and key.ctrl then
+			scan(cx, s) -- 刷新走 ⌃R
 		elseif key.name == "escape" then
 			if s.filter == "" then
 				return false
 			end
-			s.filter = ""
+			if s.ftimer then
+				s.ftimer.cancel()
+				s.ftimer = nil
+			end
+			s.filter, s.filter_cursor, s.applied, s.sel = "", 0, "", 1
+		-- 搜索框：文本由程序拥有，光标右移/退格都按字符（UTF-16）走
+		elseif key.name == "left" then
+			s.filter_cursor = math.max(s.filter_cursor - 1, 0)
+		elseif key.name == "right" then
+			s.filter_cursor = math.min(s.filter_cursor + 1, u16_len(s.filter))
+		elseif key.name == "home" then
+			s.filter_cursor = 0
+		elseif key.name == "end" then
+			s.filter_cursor = u16_len(s.filter)
 		elseif key.name == "backspace" then
-			s.filter = string.sub(s.filter, 1, -2)
+			if s.filter_cursor > 0 then
+				s.filter, s.filter_cursor = del_back(s.filter, s.filter_cursor)
+				schedule_filter(s, cx)
+			end
+		elseif key.name == "delete" then
+			if s.filter_cursor < u16_len(s.filter) then
+				s.filter, s.filter_cursor = del_fwd(s.filter, s.filter_cursor)
+				schedule_filter(s, cx)
+			end
 		elseif key.name == "paste" and key.text then
-			-- 粘贴：取首个非空行进过滤
 			local first = string.match(key.text, "[^\r\n]+")
 			if first and trim(first) ~= "" then
-				s.filter = trim(first)
-				s.sel = 1
+				s.filter, s.filter_cursor = ins_text(s.filter, s.filter_cursor, trim(first))
+				schedule_filter(s, cx)
 			end
-		elseif key.name == "r" and key.ctrl then
-			scan(cx, s) -- 刷新走 ⌃R，字母 r 留给搜索
 		elseif key.text and #key.text > 0 and not key.ctrl and not key.meta and not key.alt then
-			-- 单键（含中文等多字节字符）直接进过滤
-			s.filter ..= key.text
-			s.sel = 1
+			s.filter, s.filter_cursor = ins_text(s.filter, s.filter_cursor, key.text)
+			schedule_filter(s, cx)
 		else
 			return false
 		end
@@ -750,6 +823,13 @@ local sessions: BlockDef<State> = {
 	end,
 
 	event = function(s, ev, cx)
+		if ev.ev == "focus" then
+			-- 点击搜索框：把焦点交给它（其余字段如弹窗输入框，打开时已设）
+			if ev.id == SEARCH_ID then
+				focus_field(cx, SEARCH_ID)
+			end
+			return
+		end
 		if ev.ev == "error" then
 			-- Tern 拒绝了 view/op：显示到表头，否则完全静默（日志里有）
 			s.err = "视图错误: " .. clip(tostring(ev.msg or ""), 60)
@@ -765,9 +845,11 @@ local sessions: BlockDef<State> = {
 				return
 			elseif act == "close-dialog" then
 				close_dialog(s)
+				focus_field(cx, SEARCH_ID)
 				return
 			elseif act == "save-dialog" then
 				save_dialog(s)
+				focus_field(cx, SEARCH_ID)
 				return
 			end
 			-- 列表行：节点 id 形如 main.list.r3（或其子节点 main.list.r3.1）
