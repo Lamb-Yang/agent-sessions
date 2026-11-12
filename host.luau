@@ -72,7 +72,7 @@ local function ms_to_short(ms: number): string
 	end
 	local days, rem = ms // 86400000, ms % 86400000
 	local y, mo, d = days_civil(days)
-	return string.format("'%02d-%02d-%02d %02d:%02d", y % 100, mo, d, rem // 3600000, (rem % 3600000) // 60000)
+	return string.format("%02d-%02d-%02d %02d:%02d", y % 100, mo, d, rem // 3600000, (rem % 3600000) // 60000)
 end
 
 -- ---------- 工具 ----------
@@ -436,38 +436,58 @@ local function with_props(node: any, props: { [string]: any }): any
 	return node
 end
 
--- 两行式行：第一行 agent + 标题；第二行 路径 · 时间 · #标签
+-- 两行式行：第一行 [agent 徽标] 时间 标题；第二行 路径 + #标签
+local AGENT_TONE: { [string]: string } = { omp = "accent", pi = "info", opencode = "success" }
+
 local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	local menu: { string } = { "加标签…" }
 	for _, tg in s.tags[r.id] or {} do
 		table.insert(menu, 1, "移除:" .. tg)
 	end
 	local acts = { click = "sel", dblclick = "open", menu = menu }
-	local line1: { any } = {
-		ui.span(if cur then "▸ " else "  ", if cur then "strong" else "muted"),
-		ui.span(r.agent, if cur then "strong" else "accent"),
-		ui.span("  "),
-		ui.span(if r.title ~= "" then (string.gsub(r.title, "[\r\n]+", " ")) else "(无标题)", if cur then "strong" else ""),
+
+	local agent = with_props(ui.badge(r.agent, AGENT_TONE[r.agent] or "neutral"), { role = "as-agent", actions = acts })
+	local time = with_props(ui.node("text", {
+		role = "as-time",
+		spans = { ui.span(ms_to_short(r.when_ms), "mono") },
+		truncate = "end",
+	}), { actions = acts })
+	local title = with_props(ui.node("text", {
+		role = "as-title",
+		grow = 1,
+		truncate = "end",
+		spans = { ui.span(if r.title ~= "" then (string.gsub(r.title, "[\r\n]+", " ")) else "(无标题)", if r.title ~= "" then "" else "muted") },
+	}), { actions = acts })
+	local l1 = with_props(ui.node("row", { key = "l1", gap = "sm" }, { agent, time, title }), { actions = acts })
+
+	local l2_items: { any } = {
+		with_props(ui.node("text", {
+			role = "as-path",
+			grow = 1,
+			truncate = "middle",
+			spans = { ui.span(r.cwd, "path") },
+		}), { actions = acts }),
 	}
-	local line2: { any } = { ui.span(r.cwd, "muted") }
-	if r.when_ms > 0 then
-		table.insert(line2, ui.span("  " .. ms_to_short(r.when_ms), "muted num"))
-	end
 	for _, tg in s.tags[r.id] or {} do
-		table.insert(line2, ui.span("  #" .. tg, "accent"))
+		table.insert(l2_items, with_props(ui.badge("#" .. tg, "neutral"), { role = "as-tag", actions = acts }))
 	end
-	-- 点击/双击/右键同时挂在行与两个文本节点上（文本也是命中目标）
-	return ui.node("col", { key = "r" .. idx, gap = "xs", actions = acts }, {
-		with_props(ui.text(line1), { actions = acts }),
-		with_props(ui.text(line2), { actions = acts }),
-	})
+	local l2 = with_props(ui.node("row", { key = "l2", gap = "sm" }, l2_items), { role = "as-l2", actions = acts })
+
+	return ui.node("col", {
+		key = "r" .. idx,
+		gap = "xs",
+		role = "as-row",
+		tone = if cur then "accent" else nil,
+		mark = if cur then "pick" else nil,
+		actions = acts,
+	}, { l1, l2 })
 end
 
 local function build_body(s: State, vis: { Row }): any
 	s.vis_n = #vis
 	local nodes: { any } = {}
 	if #vis == 0 then
-		table.insert(nodes, ui.text({ ui.span("没有匹配的会话（r 重扫，Tab 看全部）", "muted") }))
+		table.insert(nodes, with_props(ui.text({ ui.span("没有匹配的会话（r 重扫，Tab 看全部）", "muted") }), { role = "as-empty" }))
 	else
 		for i, r in vis do
 			nodes[i] = row_node(s, r, i == s.sel, i)
@@ -480,9 +500,9 @@ local function build_body(s: State, vis: { Row }): any
 			table.insert(head_items, node)
 		end
 	end
-	push(ui.badge(if s.mode == "project" then "本项目" else "全部", "accent"))
-	push(ui.text({ ui.span(if s.mode == "project" then s.cwd else "所有目录", "muted") }))
-	push(ui.text({ ui.span(#vis .. " 条", "muted num") }))
+	push(with_props(ui.badge(if s.mode == "project" then "本项目" else "全部", "accent"), { role = "as-mode" }))
+	push(ui.node("text", { role = "as-dir", truncate = "end", grow = 1, spans = { ui.span(if s.mode == "project" then s.cwd else "所有目录", "muted path") } }))
+	push(ui.node("text", { role = "as-count", spans = { ui.span(#vis .. " 条", "mono") } }))
 	if s.loading then
 		push(ui.badge("扫描中…", "pending"))
 	elseif s.err then
@@ -493,15 +513,27 @@ local function build_body(s: State, vis: { Row }): any
 	end
 
 	return {
-		main = ui.col({ ui.row(head_items), ui.node("col", { key = "list", gap = "xs" }, nodes) }),
+		main = ui.col({
+			ui.node("row", { key = "head", gap = "sm", role = "as-head" }, head_items),
+			ui.node("col", { key = "list", gap = "xs" }, nodes),
+		}),
 		dock = ui.col({
-			ui.text({ ui.span("↑↓ 移动 · Enter 新 tab 恢复 · Tab 本项目/全部 · ⌃T 打标签（弹窗，逗号分隔多个） · 输入 #标签名 只看该标签 · ⌃R 刷新 · Esc 清除", "muted") }),
+			ui.text({
+				ui.span("↑↓", "muted"), ui.span(" 移动    ", "muted"),
+				ui.span("enter", "key"), ui.span(" 恢复    ", "muted"),
+				ui.span("tab", "key"), ui.span(" 本项目/全部    ", "muted"),
+				ui.span("ctrl+t", "key"), ui.span(" 打标签    ", "muted"),
+				ui.span("#标签", "code"), ui.span(" 只看该标签    ", "muted"),
+				ui.span("ctrl+r", "key"), ui.span(" 刷新    ", "muted"),
+				ui.span("esc", "key"), ui.span(" 清除", "muted"),
+			}),
 		}),
 		vis = vis,
 	}
 end
 
 local sessions: BlockDef<State> = {
+	font = "sans",
 	init = function(cx, args, saved)
 		local cwd = (args and args[1] and args[1] ~= "") and args[1] or (cx.cwd or HOME)
 		if cwd == "" then
@@ -576,6 +608,7 @@ local sessions: BlockDef<State> = {
 					local b = ui.badge("#" .. tg, "accent")
 					local bp: { [string]: any } = b.p or {}
 					bp.key = "tg" .. tg
+					bp.role = "as-chip"
 					bp.actions = { click = "untag=" .. tg }
 					b.p = bp
 					table.insert(chips, b)

@@ -1,0 +1,120 @@
+/* Agent Sessions — 列表外观（Ant Design 风格：留白、圆角、浅色块、清晰层级）
+   Tern 插件的样式表是窗口级全局的，所有选择器都必须限定在本 block 的 surface 内。 */
+
+[data-surface="plugin.agent-sessions.sessions"] {
+	--as-radius: 8px;
+	--as-radius-sm: 6px;
+}
+
+/* ---------- 主区域 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] .sf-main {
+	padding: 8px 10px 10px;
+}
+
+/* ---------- 表头工具条 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-head"] {
+	align-items: center;
+	padding: 2px 4px 8px;
+	margin-bottom: 6px;
+	border-bottom: 1px solid var(--l2);
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-count"] {
+	color: var(--t3);
+	font-variant-numeric: tabular-nums;
+	font-size: 12px;
+}
+
+/* ---------- 行 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-row"] {
+	padding: 7px 10px;
+	border-radius: var(--as-radius);
+	border: 1px solid transparent;
+	transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-row"]:hover {
+	background: var(--l1);
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-row"][data-tone="accent"] {
+	background: color-mix(in srgb, var(--accent) 9%, transparent);
+	border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* 第二行（路径/标签）稍收紧 */
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-l2"] {
+	opacity: 0.92;
+}
+
+/* ---------- agent 徽标（底色） ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-agent"] {
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	padding: 1px 7px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--tc, var(--accent)) 16%, transparent);
+	color: var(--tc, var(--accent-ink));
+	min-width: 5.5ch;
+	justify-content: center;
+}
+
+/* ---------- 时间 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-time"] {
+	color: var(--t3);
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+	letter-spacing: 0.01em;
+}
+
+/* ---------- 标题 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-title"] {
+	color: var(--t1);
+	font-size: 13.5px;
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-row"][data-tone="accent"] [data-role="as-title"] {
+	font-weight: 550;
+}
+
+/* ---------- 路径 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-path"] {
+	color: var(--t4);
+	font-size: 11.5px;
+}
+
+/* ---------- 标签 chips ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-tag"] {
+	font-size: 11px;
+	padding: 1px 6px;
+	border-radius: var(--as-radius-sm);
+	background: color-mix(in srgb, var(--accent) 10%, transparent);
+	color: var(--accent-ink);
+}
+
+/* ---------- 弹窗里的已有标签 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-chip"] {
+	font-size: 11.5px;
+	padding: 2px 8px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	color: var(--accent-ink);
+}
+
+/* ---------- dock 键位提示 ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] .sf-dock {
+	padding: 6px 12px;
+	border-top: 1px solid var(--l1);
+}

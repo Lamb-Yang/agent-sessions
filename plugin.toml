@@ -4,6 +4,7 @@ name = "Agent Sessions"
 version = "0.1.0"
 description = "List omp, pi and OpenCode sessions for the current project and resume them in a new pane."
 icon = "terminal"
+styles = ["css/style.css"]
 host = "host.luau"
 window = "window.luau"
 
