@@ -68,28 +68,33 @@
 /* ---------- 时间 ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-time"] {
-	color: var(--t3);
-	font-size: 11.5px;
+	color: var(--t2);
+	font-size: 13px;
 	font-variant-numeric: tabular-nums;
-	letter-spacing: 0.01em;
+	padding: 2px 7px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--accent) 9%, transparent);
 }
 
 /* ---------- 标题 ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-title"] {
 	color: var(--t1);
-	font-size: 13.5px;
-}
-
-[data-surface="plugin.agent-sessions.sessions"] [data-role="as-row"][data-tone="accent"] [data-role="as-title"] {
-	font-weight: 550;
+	font-size: 13px;
+	font-weight: 580;
+	padding: 2px 8px;
+	border-radius: var(--as-radius-sm);
+	background: color-mix(in srgb, var(--t1) 5%, transparent);
 }
 
 /* ---------- 路径 ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-path"] {
-	color: var(--t4);
-	font-size: 11.5px;
+	color: var(--t3);
+	font-size: 11px;
+	padding: 2px 7px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--t1) 4%, transparent);
 }
 
 /* ---------- 标签 chips ---------- */
@@ -100,6 +105,13 @@
 	border-radius: var(--as-radius-sm);
 	background: color-mix(in srgb, var(--accent) 10%, transparent);
 	color: var(--accent-ink);
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-tag-more"] {
+	font-size: 11px;
+	padding: 1px 5px;
+	border-radius: var(--as-radius-sm);
+	color: var(--t3);
 }
 
 /* ---------- 弹窗里的已有标签 ---------- */

@@ -75,7 +75,7 @@ local function ms_to_short(ms: number): string
 	end
 	local days, rem = ms // 86400000, ms % 86400000
 	local y, mo, d = days_civil(days)
-	return string.format("%02d-%02d-%02d %02d:%02d", y % 100, mo, d, rem // 3600000, (rem % 3600000) // 60000)
+	return string.format("%04d-%02d-%02d %02d:%02d", y, mo, d, rem // 3600000, (rem % 3600000) // 60000)
 end
 
 -- ---------- 工具 ----------
@@ -510,6 +510,7 @@ local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	local time = with_props(ui.node("text", {
 		role = "as-time",
 		spans = { ui.span(ms_to_short(r.when_ms), "mono") },
+		spans = { ui.span(relative_time(r.when_ms, s.now_ms)) },
 		truncate = "end",
 	}), { actions = acts })
 	local title = with_props(ui.node("text", {
