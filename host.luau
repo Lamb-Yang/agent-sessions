@@ -11,6 +11,7 @@ type Row = {
 	title: string,
 	cwd: string,
 	when_ms: number,
+	display_time: string,
 	cmd: string,
 }
 
@@ -21,11 +22,14 @@ type State = {
 	rows_rev: number, -- 每次扫描+1，供界面缓存判断
 	tags: { [string]: { string } }, -- 会话 id → 标签列表（tern.kv "tags"）
 	tags_rev: number, -- 每次标签增删+1，供界面缓存判断
+	open_dirs: { [string]: boolean }, -- 全部视图中手动展开的完整目录
+	dirs_rev: number,
 	filter: string, -- 搜索框文本（输入即显示）
 	applied: string, -- 实际用于过滤的文本（输入防抖后同步）
 	filter_cursor: number, -- 搜索框光标，UTF-16 单位
 	ftimer: any?, -- 过滤防抖定时器
 	dialog: { row_id: string, text: string, cursor: number }?, -- 打标签弹窗；cursor 为 UTF-16 单位
+	tag_preview: string?, -- 查看全部标签时的会话 id
 	sel: number,
 	vis_n: number, -- 当前可见行数（随界面缓存更新）
 	now_ms: number, -- 最近一次扫描的 epoch 毫秒，用于相对时间
@@ -66,7 +70,7 @@ local function iso_ms(iso: string): number
 	if not y then
 		return 0
 	end
-	return (civil_days(tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number) * 86400
+	return ((civil_days(tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number) - 2440588) * 86400
 		+ (tonumber(h) :: number) * 3600 + (tonumber(mi) :: number) * 60 + (tonumber(s) :: number)) * 1000
 end
 
@@ -75,7 +79,7 @@ local function ms_to_short(ms: number): string
 		return "?"
 	end
 	local days, rem = ms // 86400000, ms % 86400000
-	local y, mo, d = days_civil(days)
+	local y, mo, d = days_civil(days + 2440588)
 	return string.format("%04d-%02d-%02d %02d:%02d", y, mo, d, rem // 3600000, (rem % 3600000) // 60000)
 end
 
@@ -126,15 +130,18 @@ end
 -- ---------- 扫描 ----------
 
 local function scan_script(): string
-	-- 每个会话 jsonl 只取前 30 行里需要的类型行；session_info（pi 重命名）全文扫描；OpenCode 走 sqlite3。
+	-- 前 30 行取 title/session；前 200 行取 message（标题兜底 + 判断会话是否真的空）；
+	-- session_info（pi 重命名）全文扫描；OpenCode 走 sqlite3。
 	local awk = string.format(
-		[[awk '{ si = ($0 ~ /"type": *"session_info"/); pi_ = (FILENAME ~ "/.pi/"); if (si || (FNR<=30 && ($0 ~ /"type": *"(title|session)"/ || (pi_ && $0 ~ /"type": *"message"/)))) print "F%s" FILENAME "%s" substr($0,1,800) }' %s %s 2>/dev/null]],
+		[[awk '{ m = ($0 ~ /"type": *"message"/); if (($0 ~ /"type": *"session_info"/) || (FNR<=30 && ($0 ~ /"type": *"(title|session)"/)) || (FNR<=200 && m)) print "F%s" FILENAME "%s" substr($0,1,800) }' %s %s 2>/dev/null]],
 		US, US, HOME .. "/.omp/agent/sessions/*/*.jsonl", HOME .. "/.pi/agent/sessions/*/*.jsonl")
 	local sql = string.format(
-		[[sqlite3 -json %s "select id, ifnull(title,'') as title, directory, time_updated from session_v2" 2>/dev/null | awk '{print "D%s" $0}']],
+		[[sqlite3 -json %s "select id, ifnull(title,'') as title, directory, time_updated, strftime('%%Y-%%m-%%d %%H:%%M', time_updated/1000, 'unixepoch', 'localtime') as shown from session_v2" 2>/dev/null | awk '{print "D%s" $0}']],
 		HOME .. "/.local/share/opencode/opencode.db", US)
+	-- 显示时间取会话 jsonl 的创建时间，由 stat 按系统时区格式化（一个进程处理全部文件）
+	local files = [[find ]] .. HOME .. [[/.omp/agent/sessions ]] .. HOME .. [[/.pi/agent/sessions -name '*.jsonl' -type f -exec stat -f 'S]] .. US .. [[%B]] .. US .. [[%SB]] .. US .. [[%N' -t '%Y-%m-%d %H:%M' {} + 2>/dev/null]]
 	local now = [[date +%s | awk '{print "N]] .. US .. [[" $0 "000"}']]
-	return awk .. "\n" .. sql .. "\n" .. now
+	return awk .. "\n" .. files .. "\n" .. sql .. "\n" .. now
 end
 
 -- pi 的 message.content 可能是字符串，也可能是 [{type="text", text=…}, …]
@@ -157,7 +164,8 @@ end
 
 local function collect(out: { Row }, stdout: string): number
 	local byFile: { [string]: any } = {}
-	local now_ms = 0
+	local file_ms: { [string]: number } = {}
+	local file_time: { [string]: string } = {}
 	for line in string.gmatch(stdout, "[^\r\n]+") do
 		local tag = string.sub(line, 1, 1)
 		if tag == "F" then
@@ -189,6 +197,12 @@ local function collect(out: { Row }, stdout: string): number
 					end
 				end
 			end
+		elseif tag == "S" then
+			local sec, shown, path = string.match(line, "^S" .. US .. "([^" .. US .. "]*)" .. US .. "([^" .. US .. "]*)" .. US .. "(.*)$")
+			if sec and path then
+				file_ms[path] = (tonumber(sec) or 0) * 1000
+				file_time[path] = shown
+			end
 		elseif tag == "N" then
 			now_ms = tonumber(string.sub(line, 3)) or 0
 		elseif tag == "D" then
@@ -197,12 +211,14 @@ local function collect(out: { Row }, stdout: string): number
 				for _, o in arr do
 					if type(o) == "table" and type(o["id"]) == "string" then
 						local title = if type(o["title"]) == "string" and o["title"] ~= "" then o["title"] else o["id"]
+						local when_ms = tonumber(o["time_updated"]) or 0
 						table.insert(out, {
 							id = "opencode:" .. o["id"],
 							agent = "opencode",
+							display_time = if type(o["shown"]) == "string" and o["shown"] ~= "" then o["shown"] else ms_to_short(when_ms),
 							title = clip(title, 90),
 							cwd = if type(o["directory"]) == "string" then o["directory"] else HOME,
-							when_ms = tonumber(o["time_updated"]) or 0,
+							when_ms = when_ms,
 							cmd = "opencode --session " .. o["id"],
 						})
 					end
@@ -212,15 +228,22 @@ local function collect(out: { Row }, stdout: string): number
 	end
 	for path, f in byFile do
 		local sess = f.session
+		-- 全部会话都列出：没有标题也没有消息的也保留，标题显示为「(无标题)」
+		local named = f.title
+		if named == nil or named == "" then
+			named = f.user
+		end
 		if type(sess) == "table" and type(sess["cwd"]) == "string" then
 			local agent = if string.find(path, "/.pi/", 1, true) then "pi" else "omp"
 			local iso = if type(sess["timestamp"]) == "string" then sess["timestamp"] else ""
+			local when_ms = file_ms[path] or iso_ms(iso)
 			table.insert(out, {
 				id = agent .. ":" .. path,
 				agent = agent,
-				title = clip(f.title or f.user or tostring(sess["id"] or path), 90),
+				display_time = file_time[path] or ms_to_short(when_ms),
+				title = clip(named or "", 90),
 				cwd = sess["cwd"],
-				when_ms = iso_ms(iso),
+				when_ms = when_ms,
 				cmd = if agent == "pi" then "pi --session " .. path else "omp --resume=" .. path,
 			})
 		end
@@ -380,7 +403,8 @@ local function visible(s: State): { Row }
 	-- "#标签名" 前缀：只看带匹配标签的会话；单独 "#" 看所有带标签的
 	local tagq = if string.sub(fl, 1, 1) == "#" then string.sub(fl, 2) else nil
 	for _, r in s.rows do
-		if s.mode == "all" or under(r.cwd, s.cwd) or under(s.cwd, r.cwd) then
+	-- 本项目：会话目录等于项目目录或在项目目录之下（父目录的会话归「全部」）
+	if s.mode == "all" or under(r.cwd, s.cwd) then
 			local hit: boolean
 			if tagq then
 				hit = false
@@ -424,7 +448,7 @@ end
 -- 搜索输入防抖：打字只更新输入框，稍后再重算列表
 local function schedule_filter(s: State, cx)
 	if s.ftimer then
-		s.ftimer.cancel()
+		s.ftimer:cancel()
 	end
 	s.ftimer = tern.timer(120, function()
 		if not pane_alive(cx) then
@@ -556,7 +580,7 @@ local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	local time = with_props(ui.node("text", {
 		role = "as-time",
 		title = exact_time,
-		spans = { ui.span(relative_time(r.when_ms, s.now_ms)) },
+		spans = { ui.span(r.display_time) },
 		truncate = "end",
 	}), { actions = acts })
 	local title = with_props(ui.node("text", {
@@ -584,8 +608,7 @@ local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	if #tags > shown then
 		table.insert(l2_items, with_props(ui.badge("+" .. tostring(#tags - shown), "neutral"), {
 			role = "as-tag-more",
-			title = table.concat(tags, "  "),
-			actions = acts,
+			actions = { click = "show-tags" },
 		}))
 	end
 	local l2 = with_props(ui.node("row", { key = "l2", gap = "sm" }, l2_items), { role = "as-l2", actions = acts })
@@ -600,14 +623,59 @@ local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	}, { l1, l2 })
 end
 
-local function build_body(s: State, vis: { Row }): any
-	s.vis_n = #vis
+local function build_body(s: State, matches: { Row }): any
 	local nodes: { any } = {}
-	if #vis == 0 then
-		table.insert(nodes, with_props(ui.text({ ui.span("没有匹配的会话（r 重扫，Tab 看全部）", "muted") }), { role = "as-empty" }))
+	local vis: { Row } = {}
+	local dirs: { string } = {}
+	local groups: { [string]: { Row } } = {}
+	if #matches == 0 then
+		table.insert(nodes, with_props(ui.text({ ui.span("没有匹配的会话（⌃R 重扫，Tab 看全部）", "muted") }), { role = "as-empty" }))
+	elseif s.mode == "project" then
+		vis = matches
 	else
+		for _, r in matches do
+			local group = groups[r.cwd]
+			if not group then
+				group = {}
+				groups[r.cwd] = group
+				table.insert(dirs, r.cwd)
+			end
+			table.insert(group, r)
+		end
+		for _, dir in dirs do
+			if s.applied ~= "" or s.open_dirs[dir] == true then
+				for _, r in groups[dir] do
+					table.insert(vis, r)
+				end
+			end
+		end
+	end
+	if s.sel > #vis then
+		s.sel = math.max(#vis, 1)
+	end
+	s.vis_n = #vis
+	if s.mode == "project" then
 		for i, r in vis do
-			nodes[i] = row_node(s, r, i == s.sel, i)
+			table.insert(nodes, row_node(s, r, i == s.sel, i))
+		end
+	else
+		local row_index = 0
+		for i, dir in dirs do
+			local group = groups[dir]
+			local expanded = s.applied ~= "" or s.open_dirs[dir] == true
+			local acts = { click = "toggle-dir" }
+			local label = ui.node("text", {
+				role = "as-dir-label", grow = 1, truncate = "middle", title = dir,
+				spans = { ui.span((if expanded then "▾ " else "▸ ") .. dir, "path") }, actions = acts,
+			})
+			local count = with_props(ui.badge(tostring(#group) .. " 条", "neutral"), { actions = acts })
+			table.insert(nodes, ui.node("row", { key = "d" .. i, role = "as-dir-group", gap = "sm", actions = acts }, { label, count }))
+			if expanded then
+				for _, r in group do
+					row_index += 1
+					table.insert(nodes, row_node(s, r, row_index == s.sel, row_index))
+				end
+			end
 		end
 	end
 
@@ -619,7 +687,7 @@ local function build_body(s: State, vis: { Row }): any
 	end
 	push(with_props(ui.badge(if s.mode == "project" then "本项目" else "全部", "accent"), { role = "as-mode" }))
 	push(ui.node("text", { role = "as-dir", truncate = "end", grow = 1, spans = { ui.span(if s.mode == "project" then s.cwd else "所有目录", "muted path") } }))
-	push(ui.node("text", { role = "as-count", spans = { ui.span(#vis .. " 条", "mono") } }))
+	push(ui.node("text", { role = "as-count", spans = { ui.span(#matches .. " 条") } }))
 	if s.loading then
 		push(ui.badge("扫描中…", "pending"))
 	elseif s.err then
@@ -628,6 +696,7 @@ local function build_body(s: State, vis: { Row }): any
 	if s.filter ~= "" then
 		push(ui.badge(if string.sub(s.filter, 1, 1) == "#" then "标签 " .. clip(s.filter, 30) else "过滤 " .. clip(s.filter, 30), "info"))
 	end
+	push(ui.button("刷新", { variant = "quiet", icon = "repeat", actions = { click = "refresh" } }))
 
 	return {
 		main = with_props(ui.col({
@@ -641,12 +710,13 @@ local function build_body(s: State, vis: { Row }): any
 				ui.span("enter", "key"), ui.span(" 恢复    ", "muted"),
 				ui.span("tab", "key"), ui.span(" 本项目/全部    ", "muted"),
 				ui.span("ctrl+t", "key"), ui.span(" 打标签    ", "muted"),
-				ui.span("#标签", "code"), ui.span(" 只看该标签    ", "muted"),
+				ui.span("#标签", "muted"), ui.span(" 只看该标签    ", "muted"),
 				ui.span("ctrl+r", "key"), ui.span(" 刷新    ", "muted"),
 				ui.span("esc", "key"), ui.span(" 清除", "muted"),
 			}),
 		}),
 		vis = vis,
+		dirs = dirs,
 	}
 end
 
@@ -666,12 +736,14 @@ local sessions: BlockDef<State> = {
 			end)(),
 			rows_rev = 0,
 			tags = load_tags(),
+			open_dirs = {},
+			dirs_rev = 0,
 			tags_rev = 0,
 			filter = if saved then tostring(saved.filter or "") else "",
 			applied = if saved then tostring(saved.filter or "") else "",
 			filter_cursor = 0,
 			ftimer = nil,
-			dialog = nil,
+			tag_preview = nil,
 			sel = if saved then math.max(tonumber(saved.sel) or 1, 1) else 1,
 			vis_n = 0,
 			now_ms = (function()
@@ -704,18 +776,13 @@ local sessions: BlockDef<State> = {
 	view = function(s, _cx)
 		-- 主列表按状态签名缓存：弹窗打字不改变列表，直接复用上次构建的节点
 		local function sig_of(): string
-			return string.format("%s\1%s\1%d\1%d\1%d\1%s\1%s", s.mode, s.applied, s.sel, s.rows_rev, s.tags_rev, tostring(s.loading), s.err or "")
+			return string.format("%s\1%s\1%d\1%d\1%d\1%d\1%s\1%s", s.mode, s.applied, s.sel, s.rows_rev, s.tags_rev, s.dirs_rev, tostring(s.loading), s.err or "")
 		end
 		local sig = sig_of()
 		local body = s.body_cache
 		if s.body_sig ~= sig or body == nil then
-			local vis = visible(s)
-			if s.sel > #vis then
-				s.sel = math.max(#vis, 1)
-				sig = sig_of()
-			end
-			body = build_body(s, vis)
-			s.body_cache, s.body_sig = body, sig
+			body = build_body(s, visible(s))
+			s.body_cache, s.body_sig = body, sig_of()
 		end
 
 		-- ⌃T 弹窗：打标签。overlay 不抢键盘，键在 key 里按状态路由。
@@ -750,11 +817,11 @@ local sessions: BlockDef<State> = {
 					icon = "terminal",
 					head = { ui.span("打标签") },
 					meta = { ui.span(if row then clip(row.title, 24) else "", "muted") },
-					size = "sm",
+					size = "md",
 					modal = true,
 					foot = "layer.tags.foot",
 				}, {
-					ui.node("row", { key = "have", gap = "sm" }, chips),
+					ui.node("row", { key = "have", gap = "sm", wrap = true }, chips),
 					ui.node("input", {
 						key = "field",
 						text = d.text,
@@ -764,6 +831,24 @@ local sessions: BlockDef<State> = {
 					ui.node("row", { key = "foot", gap = "sm", justify = "end" }, {
 						ui.button("取消", { variant = "quiet", keys = { "esc" }, actions = { click = "close-dialog" } }),
 						ui.button("保存", { keys = { "enter" }, actions = { click = "save-dialog" } }),
+					}),
+				}),
+			})
+		end
+		if s.tag_preview then
+			local preview_tags = s.tags[s.tag_preview] or {}
+			local preview_chips: { any } = {}
+			for _, tg in preview_tags do
+				table.insert(preview_chips, ui.badge("#" .. tg, "accent"))
+			end
+			layer = ui.col({
+				ui.node("overlay", {
+					key = "tag-preview", icon = "tag", head = { ui.span("全部标签") },
+					size = "md", modal = true, foot = "layer.tag-preview.foot",
+				}, {
+					ui.node("row", { key = "chips", gap = "sm", wrap = true }, preview_chips),
+					ui.node("row", { key = "foot", gap = "sm", justify = "end" }, {
+						ui.button("关闭", { variant = "quiet", keys = { "esc" }, actions = { click = "close-tags" } }),
 					}),
 				}),
 			})
@@ -816,9 +901,16 @@ local sessions: BlockDef<State> = {
 			cx:render()
 			return false
 		end
+		if s.tag_preview then
+			if key.name == "escape" then
+				s.tag_preview = nil
+				cx:render()
+			end
+			return false
+		end
 		local n = math.max(s.vis_n, 1)
 		if key.name == "t" and key.ctrl then
-			local r = visible(s)[s.sel]
+			local r = s.body_cache and s.body_cache.vis[s.sel]
 			if r then
 				open_dialog(s, r.id, cx)
 				return true
@@ -834,7 +926,7 @@ local sessions: BlockDef<State> = {
 		elseif key.name == "page_down" then
 			s.sel = math.min(s.sel + 15, n)
 		elseif key.name == "enter" then
-			local r = visible(s)[s.sel]
+			local r = s.body_cache and s.body_cache.vis[s.sel]
 			if r then
 				resume(r, cx)
 			end
@@ -848,7 +940,7 @@ local sessions: BlockDef<State> = {
 				return false
 			end
 			if s.ftimer then
-				s.ftimer.cancel()
+				s.ftimer:cancel()
 				s.ftimer = nil
 			end
 			s.filter, s.filter_cursor, s.applied, s.sel = "", 0, "", 1
@@ -916,9 +1008,45 @@ local sessions: BlockDef<State> = {
 				focus_field(cx, SEARCH_ID)
 				return
 			end
+			if act == "refresh" then
+				scan(cx, s)
+				return
+			end
+			if act == "show-tags" then
+				local idx = tonumber(string.match(ev.id or "", "%.r(%d+)"))
+				local row = if idx and s.body_cache then s.body_cache.vis[idx] else nil
+				if row then
+					s.tag_preview = row.id
+				end
+				return
+			elseif act == "close-tags" then
+				s.tag_preview = nil
+				return
+			end
+			if act == "toggle-dir" then
+				local idx = tonumber(string.match(ev.id or "", "%.d(%d+)"))
+				local body = s.body_cache
+				local dir = if idx and body then body.dirs[idx] else nil
+				if dir and s.applied == "" then
+					local selected = body.vis[s.sel]
+					s.open_dirs[dir] = not s.open_dirs[dir] or nil
+					s.dirs_rev += 1
+					local next_body = build_body(s, visible(s))
+					if selected then
+						for i, row in next_body.vis do
+							if row.id == selected.id then
+								s.sel = i
+								break
+							end
+						end
+					end
+					s.body_sig = nil
+				end
+				return
+			end
 			-- 列表行：节点 id 形如 main.list.r3（或其子节点 main.list.r3.1）
 			local idx = tonumber(string.match(ev.id or "", "%.r(%d+)"))
-			local vis = s.body_cache and s.body_cache.vis or visible(s)
+			local vis = if s.body_cache then s.body_cache.vis else {}
 			local r = if idx then vis[idx] else nil
 			if not r then
 				return
@@ -942,7 +1070,7 @@ local sessions: BlockDef<State> = {
 		if ev.ev ~= "select" and ev.ev ~= "activate" then
 			return
 		end
-		local vis = visible(s)
+		local vis = if s.body_cache then s.body_cache.vis else {}
 		for i, r in vis do
 			if r.id == ev.item then
 				s.sel = i

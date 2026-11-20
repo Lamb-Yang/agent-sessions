@@ -4,6 +4,11 @@
 [data-surface="plugin.agent-sessions.sessions"] {
 	--as-radius: 8px;
 	--as-radius-sm: 6px;
+	/* 字号全部相对区域基准 --sf-fs，跟随 Tern 的界面字号设置 */
+	--as-fs: var(--sf-fs, 13px);
+	--as-fs-meta: calc(var(--as-fs) * 0.92);
+	--as-fs-chip: calc(var(--as-fs) * 0.88);
+	--as-fs-tiny: calc(var(--as-fs) * 0.85);
 }
 
 /* ---------- 主区域 ---------- */
@@ -24,7 +29,23 @@
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-count"] {
 	color: var(--t3);
 	font-variant-numeric: tabular-nums;
-	font-size: 12px;
+	font-size: var(--as-fs-meta);
+}
+
+/* 全部视图的目录标题 */
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir-group"] {
+	padding: 6px 10px;
+	border-radius: var(--as-radius);
+	background: var(--l1);
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir-group"]:hover {
+	background: var(--l2);
+}
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir-label"] {
+	color: var(--t2);
+	font-size: var(--as-fs-meta);
 }
 
 /* ---------- 行 ---------- */
@@ -53,7 +74,7 @@
 /* ---------- agent 徽标（底色） ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-agent"] {
-	font-size: 11px;
+	font-size: var(--as-fs-tiny);
 	font-weight: 600;
 	letter-spacing: 0.04em;
 	text-transform: uppercase;
@@ -65,11 +86,22 @@
 	justify-content: center;
 }
 
+/* ---------- 路径（唯一使用等宽字体的文本） ---------- */
+
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-path"],
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-path"] span,
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir"],
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir"] span,
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir-label"],
+[data-surface="plugin.agent-sessions.sessions"] [data-role="as-dir-label"] span {
+	font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace) !important;
+}
+
 /* ---------- 时间 ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-time"] {
 	color: var(--t2);
-	font-size: 13px;
+	font-size: var(--as-fs);
 	font-variant-numeric: tabular-nums;
 	padding: 2px 7px;
 	border-radius: 999px;
@@ -80,7 +112,7 @@
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-title"] {
 	color: var(--t1);
-	font-size: 13px;
+	font-size: var(--as-fs);
 	font-weight: 580;
 	padding: 2px 8px;
 	border-radius: var(--as-radius-sm);
@@ -91,7 +123,7 @@
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-path"] {
 	color: var(--t3);
-	font-size: 11px;
+	font-size: var(--as-fs-tiny);
 	padding: 2px 7px;
 	border-radius: 999px;
 	background: color-mix(in srgb, var(--t1) 4%, transparent);
@@ -100,7 +132,7 @@
 /* ---------- 标签 chips ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-tag"] {
-	font-size: 11px;
+	font-size: var(--as-fs-tiny);
 	padding: 1px 6px;
 	border-radius: var(--as-radius-sm);
 	background: color-mix(in srgb, var(--accent) 10%, transparent);
@@ -108,7 +140,7 @@
 }
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-tag-more"] {
-	font-size: 11px;
+	font-size: var(--as-fs-tiny);
 	padding: 1px 5px;
 	border-radius: var(--as-radius-sm);
 	color: var(--t3);
@@ -117,7 +149,7 @@
 /* ---------- 弹窗里的已有标签 ---------- */
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-chip"] {
-	font-size: 11.5px;
+	font-size: var(--as-fs-chip);
 	padding: 2px 8px;
 	border-radius: 999px;
 	background: color-mix(in srgb, var(--accent) 12%, transparent);
@@ -135,7 +167,7 @@
 
 [data-surface="plugin.agent-sessions.sessions"] [data-role="as-search"] {
 	margin: 2px 2px 8px;
-	font-size: 13px;
+	font-size: var(--as-fs);
 	border-radius: var(--as-radius);
 	background: var(--l1);
 }
