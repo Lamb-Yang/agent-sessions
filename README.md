@@ -32,3 +32,9 @@ tern plugin install github.com/<你的用户名>/tern-agent-sessions
 | OpenCode | `~/.local/share/opencode/opencode.db`（sqlite3） | `opencode --session <id>` |
 
 只读扫描（每个 jsonl 只读前 30 行的相关行），不改任何会话数据。
+
+## 缓存
+
+插件常驻后台：daemon 运行期间每 60s 自动扫描一次，把会话列表写入
+`tern.kv` 缓存。打开列表时先用缓存秒显（表头显示「刷新中…」），随后静默刷新；
+标签数据同存于 `tern.kv`，跨窗口、重启保留。

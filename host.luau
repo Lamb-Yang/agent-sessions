@@ -28,6 +28,7 @@ type State = {
 	dialog: { row_id: string, text: string, cursor: number }?, -- 打标签弹窗；cursor 为 UTF-16 单位
 	sel: number,
 	vis_n: number, -- 当前可见行数（随界面缓存更新）
+	now_ms: number, -- 最近一次扫描的 epoch 毫秒，用于相对时间
 	loading: boolean,
 	err: string?,
 	-- 界面缓存：弹窗输入时主列表不变，避免每键重建整棵树
@@ -78,6 +79,28 @@ local function ms_to_short(ms: number): string
 	return string.format("%04d-%02d-%02d %02d:%02d", y, mo, d, rem // 3600000, (rem % 3600000) // 60000)
 end
 
+local function relative_time(when_ms: number, now_ms: number): string
+	if when_ms <= 0 or now_ms <= 0 then
+		return ms_to_short(when_ms)
+	end
+	local delta = math.max(now_ms - when_ms, 0)
+	if delta < 60000 then
+		return "刚刚"
+	elseif delta < 3600000 then
+		return tostring(delta // 60000) .. " 分钟前"
+	elseif delta < 86400000 then
+		return tostring(delta // 3600000) .. " 小时前"
+	elseif delta < 7 * 86400000 then
+		return tostring(delta // 86400000) .. " 天前"
+	end
+	return ms_to_short(when_ms)
+end
+
+local function short_path(p: string): string
+	local parent, leaf = string.match(p, "/([^/]+)/([^/]+)$")
+	return if parent and leaf then "…/" .. parent .. "/" .. leaf else p
+end
+
 -- ---------- 工具 ----------
 
 local function trim(s: string): string
@@ -110,7 +133,8 @@ local function scan_script(): string
 	local sql = string.format(
 		[[sqlite3 -json %s "select id, ifnull(title,'') as title, directory, time_updated from session_v2" 2>/dev/null | awk '{print "D%s" $0}']],
 		HOME .. "/.local/share/opencode/opencode.db", US)
-	return awk .. "\n" .. sql
+	local now = [[date +%s | awk '{print "N]] .. US .. [[" $0 "000"}']]
+	return awk .. "\n" .. sql .. "\n" .. now
 end
 
 -- pi 的 message.content 可能是字符串，也可能是 [{type="text", text=…}, …]
@@ -131,8 +155,9 @@ local function content_text(m: any): string
 	return ""
 end
 
-local function collect(out: { Row }, stdout: string)
+local function collect(out: { Row }, stdout: string): number
 	local byFile: { [string]: any } = {}
+	local now_ms = 0
 	for line in string.gmatch(stdout, "[^\r\n]+") do
 		local tag = string.sub(line, 1, 1)
 		if tag == "F" then
@@ -164,6 +189,8 @@ local function collect(out: { Row }, stdout: string)
 					end
 				end
 			end
+		elseif tag == "N" then
+			now_ms = tonumber(string.sub(line, 3)) or 0
 		elseif tag == "D" then
 			local arr = decode_obj(string.sub(line, 3))
 			if type(arr) == "table" then
@@ -198,6 +225,7 @@ local function collect(out: { Row }, stdout: string)
 			})
 		end
 	end
+	return now_ms
 end
 
 -- ---------- 标签 ----------
@@ -436,9 +464,44 @@ local function save_dialog(s: State)
 	close_dialog(s)
 end
 
+-- 跑一次扫描：解析+排序后回调 (rows, raw)。供 block 刷新与后台循环共用。
+local function fetch_rows(cb: (rows: { Row }, r: any, now_ms: number) -> ())
+	tern.process.run({ "sh", "-c", scan_script() }, { timeout_ms = 15000 }, function(r)
+		local rows: { Row } = {}
+		local now_ms = 0
+		pcall(function()
+			now_ms = collect(rows, r.stdout)
+		end)
+		table.sort(rows, function(a, b)
+			return a.when_ms > b.when_ms
+		end)
+		cb(rows, r, now_ms)
+	end)
+end
+
+-- 清掉已消失会话的标签条目，并把结果写入 kv 缓存（后台/打开共用）
+local function persist_scan(rows: { Row }, now_ms: number)
+	local tags = load_tags()
+	local alive: { [string]: boolean } = {}
+	for _, row in rows do
+		alive[row.id] = true
+	end
+	local dirty = false
+	for id in tags do
+		if not alive[id] then
+			tags[id] = nil
+			dirty = true
+		end
+	end
+	if dirty then
+		tern.kv.set("tags", tags)
+	end
+	tern.kv.set("cache", { rows = rows, now_ms = now_ms, at = tern.now() })
+end
+
 local function scan(cx, s: State)
 	s.loading, s.err = true, nil
-	tern.process.run({ "sh", "-c", scan_script() }, { timeout_ms = 15000 }, function(r)
+	fetch_rows(function(rows, r, now_ms)
 		if not pane_alive(cx) then
 			return
 		end
@@ -449,29 +512,11 @@ local function scan(cx, s: State)
 				s.err = "exit " .. tostring(r.status)
 			end
 		end
-		local rows: { Row } = {}
-		pcall(collect, rows, r.stdout)
-		table.sort(rows, function(a, b)
-			return a.when_ms > b.when_ms
-		end)
 		s.rows = rows
+		s.now_ms = now_ms
 		s.rows_rev += 1
-		-- 刷新标签；会话文件已消失的条目顺手清掉
+		persist_scan(rows, now_ms)
 		local tags = load_tags()
-		local alive: { [string]: boolean } = {}
-		for _, row in rows do
-			alive[row.id] = true
-		end
-		local dirty = false
-		for id in tags do
-			if not alive[id] then
-				tags[id] = nil
-				dirty = true
-			end
-		end
-		if dirty then
-			tern.kv.set("tags", tags)
-		end
 		s.tags = tags
 		s.tags_rev += 1
 		cx:render()
@@ -507,9 +552,10 @@ local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	local acts = { click = "sel", dblclick = "open", menu = menu }
 
 	local agent = with_props(ui.badge(r.agent, AGENT_TONE[r.agent] or "neutral"), { role = "as-agent", actions = acts })
+	local exact_time = ms_to_short(r.when_ms)
 	local time = with_props(ui.node("text", {
 		role = "as-time",
-		spans = { ui.span(ms_to_short(r.when_ms), "mono") },
+		title = exact_time,
 		spans = { ui.span(relative_time(r.when_ms, s.now_ms)) },
 		truncate = "end",
 	}), { actions = acts })
@@ -524,13 +570,23 @@ local function row_node(s: State, r: Row, cur: boolean, idx: number): any
 	local l2_items: { any } = {
 		with_props(ui.node("text", {
 			role = "as-path",
+			title = r.cwd,
 			grow = 1,
-			truncate = "middle",
-			spans = { ui.span(r.cwd, "path") },
+			truncate = "end",
+			spans = { ui.span(short_path(r.cwd), "path") },
 		}), { actions = acts }),
 	}
-	for _, tg in s.tags[r.id] or {} do
-		table.insert(l2_items, with_props(ui.badge("#" .. tg, "neutral"), { role = "as-tag", actions = acts }))
+	local tags = s.tags[r.id] or {}
+	local shown = math.min(#tags, 3)
+	for i = 1, shown do
+		table.insert(l2_items, with_props(ui.badge("#" .. tags[i], "neutral"), { role = "as-tag", actions = acts }))
+	end
+	if #tags > shown then
+		table.insert(l2_items, with_props(ui.badge("+" .. tostring(#tags - shown), "neutral"), {
+			role = "as-tag-more",
+			title = table.concat(tags, "  "),
+			actions = acts,
+		}))
 	end
 	local l2 = with_props(ui.node("row", { key = "l2", gap = "sm" }, l2_items), { role = "as-l2", actions = acts })
 
@@ -604,7 +660,10 @@ local sessions: BlockDef<State> = {
 		local s: State = {
 			cwd = cwd,
 			mode = if saved and saved.mode == "all" then "all" else "project",
-			rows = {},
+			rows = (function()
+				local c = tern.kv.get("cache")
+				return if type(c) == "table" and type(c.rows) == "table" and #c.rows > 0 then c.rows else {}
+			end)(),
 			rows_rev = 0,
 			tags = load_tags(),
 			tags_rev = 0,
@@ -615,6 +674,10 @@ local sessions: BlockDef<State> = {
 			dialog = nil,
 			sel = if saved then math.max(tonumber(saved.sel) or 1, 1) else 1,
 			vis_n = 0,
+			now_ms = (function()
+				local c = tern.kv.get("cache")
+				return if type(c) == "table" then tonumber(c.now_ms) or 0 else 0
+			end)(),
 			loading = false,
 			err = nil,
 		}
@@ -895,5 +958,26 @@ local sessions: BlockDef<State> = {
 		return { mode = s.mode, filter = s.filter, sel = s.sel }
 	end,
 }
+
+-- ---------- 后台自动更新 ----------
+-- daemon 常驻期间每 60s 扫描一次（与打开 block 无关），结果写 kv 缓存；
+-- 打开列表时先用缓存秒显，再静默刷新。reload 换 VM 时旧循环随之消亡。
+
+local function bg_tick()
+	fetch_rows(function(rows, _r, now_ms)
+		persist_scan(rows, now_ms)
+	end)
+end
+
+local function bg_loop()
+	tern.timer(60000, function()
+		bg_tick()
+		bg_loop()
+	end)
+end
+tern.timer(2000, function()
+	bg_tick()
+	bg_loop()
+end)
 
 tern.block.define("sessions", sessions)
